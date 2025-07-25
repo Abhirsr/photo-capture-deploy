@@ -197,7 +197,7 @@ def process_pending_request_async():
             public_url = supabase.storage.from_(bucket_name).get_public_url(zip_filename)
             print('DEBUG: [async] public_url:', public_url)
             msg = Message("Face Match Results", recipients=[email])
-            msg.body = f"\U0001F4C1 Your matched images are here:\n\n{public_url}\n\nThis link will expire in 1 hour."
+            msg.body = f"\U0001F4C1 Your matched images are here:\n\n{public_url}\n\nThis link will expire in 8 hours."
             mail.send(msg)
             print('DEBUG: [async] Email sent')
             now = datetime.utcnow().isoformat()
@@ -215,12 +215,12 @@ def process_pending_request_async():
 # --- Scheduled cleanup for expired zips ---
 def cleanup_expired_zips():
     """
-    Periodically checks for expired zip files in Supabase Storage (older than 1 hour) and deletes them.
+    Periodically checks for expired zip files in Supabase Storage (older than 8 hours) and deletes them.
     Updates the corresponding user_requests row to 'expired'.
     """
     with app.app_context():
         now = datetime.utcnow()
-        cutoff = now - timedelta(hours=1)
+        cutoff = now - timedelta(hours=8)
         expired = supabase.table('user_requests').select('*').neq('zip_url', None).execute().data
         for req in expired:
             uploaded_at = req.get('zip_uploaded_at')
@@ -312,28 +312,26 @@ def upload_frames():
 @app.route('/store_email', methods=['POST'])
 def store_email():
     """
-    Stores the user's email, request_id, and event_name, then starts the matching process using the frames for that request_id and event's gallery.
+    Stores the user's email and request_id, then starts the matching process using the frames for that request_id and the single gallery.
     """
     print('DEBUG: /store_email called')
     data = request.get_json()
     email = data.get('email')
     request_id = data.get('request_id')
-    event_name = data.get('event_name')
-    print('DEBUG: email received:', email, 'request_id:', request_id, 'event_name:', event_name)
-    if not email or not request_id or not event_name:
-        print('DEBUG: Missing email, request_id, or event_name')
-        return jsonify(status='error', message='Missing email, request_id, or event_name.')
+    print('DEBUG: email received:', email, 'request_id:', request_id)
+    if not email or not request_id:
+        print('DEBUG: Missing email or request_id')
+        return jsonify(status='error', message='Missing email or request_id.')
     # Insert user request into Supabase
     try:
         supabase.table('user_requests').insert({
             'id': request_id,
             'email': email,
             'status': 'pending',
-            'matched_files': [],
-            'event_name': event_name
+            'matched_files': []
         }).execute()
         print('DEBUG: Inserted user_request row')
-        # Call process_user_request in a background thread, passing the request_id, email, and event_name
+        # Call process_user_request in a background thread, passing the request_id and email
         import threading
         def run_matching():
             from match_faces import run_face_matching
@@ -346,9 +344,9 @@ def store_email():
                 print(f"[ERROR] No frames found on disk for request_id={request_id}")
                 supabase.table('user_requests').update({'status': 'no_frames'}).eq('id', request_id).execute()
                 return
-            # Use the selected event's gallery folder
-            event_gallery_folder = os.path.join(GALLERY_FOLDER, event_name)
-            match_count = run_face_matching(req_dir, event_gallery_folder)
+            # Use the single gallery folder
+            gallery_folder = GALLERY_FOLDER
+            match_count = run_face_matching(req_dir, gallery_folder)
             # Clean up temp frames
             shutil.rmtree(req_dir, ignore_errors=True)
             if match_count == 0:
@@ -478,21 +476,16 @@ def list_user_logs():
 @app.route('/admin/upload_gallery', methods=['POST'])
 def admin_upload_gallery():
     """
-    (Admin) Handles file uploads to the gallery.
-    Supports zip file upload or multiple file uploads, organized by event name.
+    (Admin) Handles file uploads to the single gallery.
+    Supports zip file upload or multiple file uploads, all stored in static/gallery/.
     Returns:
         JSON: {status: 'ok'} on success, or error message.
     """
     if not is_admin_logged_in():
         return jsonify(status='error', message='Not authorized'), 403
     try:
-        event_name = request.form.get('event_name') or request.values.get('event_name')
-        if not event_name:
-            return jsonify(status='error', message='Event name is required.')
-        event_name = secure_filename(event_name.strip())
-        event_gallery_folder = os.path.join(GALLERY_FOLDER, event_name)
-        os.makedirs(event_gallery_folder, exist_ok=True)
-
+        # No event name, just upload to GALLERY_FOLDER
+        os.makedirs(GALLERY_FOLDER, exist_ok=True)
         # Check for zip upload
         if 'gallery_zip' in request.files:
             zip_file = request.files['gallery_zip']
@@ -500,10 +493,9 @@ def admin_upload_gallery():
                 zip_file.save(tmp_zip)
                 tmp_zip_path = tmp_zip.name
             with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
-                zip_ref.extractall(event_gallery_folder)
+                zip_ref.extractall(GALLERY_FOLDER)
             os.remove(tmp_zip_path)
             return jsonify(status='ok')
-
         # Check for folder upload (multiple files)
         files = request.files.getlist('gallery_files')
         ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
@@ -514,10 +506,9 @@ def admin_upload_gallery():
                 if ext not in ALLOWED_EXTENSIONS:
                     continue  # Skip non-image files
                 unique_name = f"gallery_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
-                dest_path = os.path.join(event_gallery_folder, unique_name)
+                dest_path = os.path.join(GALLERY_FOLDER, unique_name)
                 f.save(dest_path)
             return jsonify(status='ok')
-
         return jsonify(status='error', message='No files uploaded.')
     except Exception as e:
         print('❌ Gallery upload error:', e)
@@ -526,15 +517,16 @@ def admin_upload_gallery():
 @app.route('/admin/list_gallery_images')
 def admin_list_gallery_images():
     """
-    (Admin) Lists all images in the gallery folder.
+    (Admin) Lists all images in the single gallery folder.
     Returns:
-        JSON: List of image filenames.
+        JSON: {status: 'ok', images: [...]} on success, or error message.
     """
     if not is_admin_logged_in():
         return jsonify(status='error', message='Not authorized'), 403
     try:
         images = [f for f in os.listdir(GALLERY_FOLDER)
-                  if os.path.isfile(os.path.join(GALLERY_FOLDER, f)) and f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'))]
+                  if os.path.isfile(os.path.join(GALLERY_FOLDER, f)) and f.lower().endswith((
+                      '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'))]
         return jsonify(status='ok', images=images)
     except Exception as e:
         return jsonify(status='error', message=str(e))
@@ -651,18 +643,6 @@ def admin_change_password():
         return jsonify({'status': 'ok'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': 'Failed to change password.'}), 500
-
-@app.route('/list_events')
-def list_events():
-    """
-    Returns a JSON list of all event names (subfolders in static/gallery/).
-    """
-    try:
-        event_names = [d for d in os.listdir(GALLERY_FOLDER)
-                      if os.path.isdir(os.path.join(GALLERY_FOLDER, d)) and not d.startswith('.')]
-        return jsonify(status='ok', events=event_names)
-    except Exception as e:
-        return jsonify(status='error', message=str(e))
 
 if __name__ == '__main__':
     app.run(debug=True,port=5002)
